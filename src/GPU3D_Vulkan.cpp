@@ -91,6 +91,15 @@ std::string MakeVulkanShaderSource(const std::string& body,
     ReplaceAll(source, "layout (std430, binding =", "layout (std430, set = 0, binding =");
     ReplaceAll(source, "layout (std140, binding =", "layout (std140, set = 1, binding =");
     ReplaceAll(source, "layout (binding =", "layout (set = 2, binding =");
+    ReplaceAll(source,
+        "layout (set = 2, binding = 0, rgba8) writeonly uniform image2D FinalFB;",
+        "layout (set = 2, binding = 0, r32ui) writeonly uniform uimage2D FinalFB;");
+    ReplaceAll(source,
+        "    vec4 result = vec4(color.x & 0x3FU, bitfieldExtract(color.x, 8, 8), bitfieldExtract(color.x, 16, 8), bitfieldExtract(color.x, 24, 8));\n"
+        "    result /= vec4(63.0, 63.0, 63.0, 31.0);\n"
+        "    imageStore(FinalFB, ivec2(gl_GlobalInvocationID.xy), result);",
+        "    imageStore(FinalFB, ivec2(gl_GlobalInvocationID.xy), "
+        "uvec4(color.x, 0U, 0U, 0U));");
 
     const std::string looseUniforms =
         "layout (location = 0) uniform uint CurVariant;\n"
@@ -718,7 +727,7 @@ bool VulkanRenderer3D::CreateComputeResources()
 
 bool VulkanRenderer3D::CreateColorImage()
 {
-    return CreateImage(ScreenWidth, ScreenHeight, VK_FORMAT_R8G8B8A8_UNORM,
+    return CreateImage(ScreenWidth, ScreenHeight, VK_FORMAT_R32_UINT,
                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                            VK_IMAGE_USAGE_STORAGE_BIT,
                        ColorImage, ColorMemory, ColorView);
