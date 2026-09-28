@@ -16,32 +16,30 @@
     with melonDS. If not, see http://www.gnu.org/licenses/.
 */
 
-#ifndef RENDERERBACKEND_H
-#define RENDERERBACKEND_H
+#ifndef GPU_VULKAN_H
+#define GPU_VULKAN_H
 
-#include <memory>
+#include "GPU_Soft.h"
+#include "VulkanSupport.h"
 
 namespace melonDS
 {
-class NDS;
-class Renderer;
-}
 
-enum
+class VulkanRenderer : public SoftRenderer
 {
-    renderer3D_Software = 0,
-    renderer3D_OpenGL,
-    renderer3D_OpenGLCompute,
-    renderer3D_Vulkan,
-    renderer3D_Max,
+public:
+    explicit VulkanRenderer(melonDS::NDS& nds);
+    ~VulkanRenderer() override;
+
+    bool Init() override;
+    void PreSavestate() override;
+    void PostSavestate() override;
+    void SetRenderSettings(RendererSettings& settings) override;
+
+private:
+    Vulkan::Context Context;
 };
 
-namespace RendererBackend
-{
-
-std::unique_ptr<melonDS::Renderer> Create(melonDS::NDS& nds, int renderer);
-bool RequiresOpenGL(int renderer);
-
 }
 
-#endif // RENDERERBACKEND_H
+#endif // GPU_VULKAN_H

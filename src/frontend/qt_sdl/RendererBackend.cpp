@@ -20,6 +20,9 @@
 #ifdef OGLRENDERER_ENABLED
 #include "GPU_OpenGL.h"
 #endif
+#ifdef VULKANRENDERER_ENABLED
+#include "GPU_Vulkan.h"
+#endif
 
 #include "RendererBackend.h"
 
@@ -39,6 +42,11 @@ std::unique_ptr<melonDS::Renderer> Create(melonDS::NDS& nds, int renderer)
 
     case renderer3D_OpenGLCompute:
         return std::make_unique<melonDS::GLRenderer>(nds, true);
+#endif
+
+#ifdef VULKANRENDERER_ENABLED
+    case renderer3D_Vulkan:
+        return std::make_unique<melonDS::VulkanRenderer>(nds);
 #endif
 
     default:

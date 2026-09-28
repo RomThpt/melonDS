@@ -121,13 +121,12 @@ void EmuThread::run()
         emuInstance->initOpenGL(0);
 
         useOpenGL = true;
-        videoRenderer = globalCfg.GetInt("3D.Renderer");
     }
     else
     {
         useOpenGL = false;
-        videoRenderer = 0;
     }
+    videoRenderer = globalCfg.GetInt("3D.Renderer");
 
     //updateRenderer();
     videoSettingsDirty = true;
