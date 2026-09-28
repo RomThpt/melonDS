@@ -19,8 +19,12 @@
 #include "GPU3D_Vulkan.h"
 
 #include <cstring>
+#include <string>
+
+#include <shaderc/shaderc.h>
 
 #include "GPU.h"
+#include "GPU3D_Compute_shaders.h"
 #include "Platform.h"
 
 namespace melonDS
@@ -28,6 +32,63 @@ namespace melonDS
 
 using Platform::Log;
 using Platform::LogLevel;
+
+namespace
+{
+
+void ReplaceAll(std::string& value, const std::string& from, const std::string& to)
+{
+    size_t position = 0;
+    while ((position = value.find(from, position)) != std::string::npos)
+    {
+        value.replace(position, from.size(), to);
+        position += to.size();
+    }
+}
+
+std::string MakeVulkanShaderSource(const std::string& body,
+                                   const std::vector<const char*>& defines)
+{
+    std::string source = "#version 450\n";
+    for (const char* define : defines)
+    {
+        source += "#define ";
+        source += define;
+        source += '\n';
+    }
+
+    source += "#define ScreenWidth 256\n";
+    source += "#define ScreenHeight 192\n";
+    source += "#define MaxWorkTiles 12288\n";
+    source += "#define TileSize 8\n";
+    source += "const int CoarseTileCountY = 4;\n";
+    source += "#define CoarseTileArea 32\n";
+    source += "#define ClearCoarseBinMaskLocalSize 64\n";
+    source += ComputeRendererShaders::Common;
+    source += body;
+
+    ReplaceAll(source, "layout (std430, binding =", "layout (std430, set = 0, binding =");
+    ReplaceAll(source, "layout (std140, binding =", "layout (std140, set = 1, binding =");
+    ReplaceAll(source, "layout (binding =", "layout (set = 2, binding =");
+
+    const std::string looseUniforms =
+        "layout (location = 0) uniform uint CurVariant;\n"
+        "layout (location = 1) uniform vec2 InvTextureSize;\n"
+        "layout (location = 2) uniform int TexIsCapture;\n"
+        "layout (location = 3) uniform float CaptureYOffset;";
+    const std::string pushConstants =
+        "layout (push_constant) uniform RasterPushConstants\n"
+        "{\n"
+        "    uint CurVariant;\n"
+        "    vec2 InvTextureSize;\n"
+        "    int TexIsCapture;\n"
+        "    float CaptureYOffset;\n"
+        "};";
+    ReplaceAll(source, looseUniforms, pushConstants);
+    return source;
+}
+
+}
 
 VulkanRenderer3D::VulkanRenderer3D(melonDS::GPU3D& gpu3D, Vulkan::Context& context) noexcept
     : Renderer3D(gpu3D), Context(context)
@@ -66,7 +127,101 @@ bool VulkanRenderer3D::Init()
         return false;
     }
 
-    return CreateColorImage() && CreateReadbackBuffer();
+    return CreateColorImage() && CreateReadbackBuffer() && CompileShaders();
+}
+
+bool VulkanRenderer3D::CompileShader(const std::string& source,
+                                     const std::vector<const char*>& defines,
+                                     const char* name)
+{
+    const std::string shaderSource = MakeVulkanShaderSource(source, defines);
+    shaderc_compiler_t compiler = shaderc_compiler_initialize();
+    shaderc_compile_options_t options = shaderc_compile_options_initialize();
+    if (!compiler || !options)
+    {
+        if (options) shaderc_compile_options_release(options);
+        if (compiler) shaderc_compiler_release(compiler);
+        return false;
+    }
+
+    shaderc_compile_options_set_target_env(options, shaderc_target_env_vulkan,
+                                            shaderc_env_version_vulkan_1_1);
+    shaderc_compile_options_set_target_spirv(options, shaderc_spirv_version_1_3);
+    shaderc_compile_options_set_optimization_level(options,
+                                                    shaderc_optimization_level_performance);
+    shaderc_compilation_result_t result = shaderc_compile_into_spv(
+        compiler, shaderSource.c_str(), shaderSource.size(), shaderc_compute_shader,
+        name, "main", options);
+
+    const shaderc_compilation_status status = shaderc_result_get_compilation_status(result);
+    if (status != shaderc_compilation_status_success)
+    {
+        Log(LogLevel::Error, "Vulkan: failed to compile %s:\n%s\n", name,
+            shaderc_result_get_error_message(result));
+        shaderc_result_release(result);
+        shaderc_compile_options_release(options);
+        shaderc_compiler_release(compiler);
+        return false;
+    }
+
+    VkShaderModuleCreateInfo moduleInfo = {};
+    moduleInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    moduleInfo.codeSize = shaderc_result_get_length(result);
+    moduleInfo.pCode = reinterpret_cast<const u32*>(shaderc_result_get_bytes(result));
+    VkShaderModule module = VK_NULL_HANDLE;
+    const VkResult moduleResult = vkCreateShaderModule(Context.GetDevice(), &moduleInfo,
+                                                        nullptr, &module);
+    shaderc_result_release(result);
+    shaderc_compile_options_release(options);
+    shaderc_compiler_release(compiler);
+    if (moduleResult != VK_SUCCESS)
+    {
+        Log(LogLevel::Error, "Vulkan: failed to create %s module: %s (%d)\n", name,
+            Vulkan::ResultName(moduleResult), moduleResult);
+        return false;
+    }
+    ShaderModules.push_back(module);
+    return true;
+}
+
+bool VulkanRenderer3D::CompileShaders()
+{
+    using namespace ComputeRendererShaders;
+
+    return
+        CompileShader(InterpSpans, {"InterpSpans", "ZBuffer"}, "InterpSpansZ") &&
+        CompileShader(InterpSpans, {"InterpSpans", "WBuffer"}, "InterpSpansW") &&
+        CompileShader(BinCombined, {"BinCombined"}, "BinCombined") &&
+        CompileShader(DepthBlend, {"DepthBlend", "ZBuffer"}, "DepthBlendZ") &&
+        CompileShader(DepthBlend, {"DepthBlend", "WBuffer"}, "DepthBlendW") &&
+        CompileShader(Rasterise, {"Rasterise", "ZBuffer", "NoTexture"}, "RasterNoTextureZ") &&
+        CompileShader(Rasterise, {"Rasterise", "WBuffer", "NoTexture"}, "RasterNoTextureW") &&
+        CompileShader(Rasterise, {"Rasterise", "ZBuffer", "NoTexture", "Toon"}, "RasterNoTextureToonZ") &&
+        CompileShader(Rasterise, {"Rasterise", "WBuffer", "NoTexture", "Toon"}, "RasterNoTextureToonW") &&
+        CompileShader(Rasterise, {"Rasterise", "ZBuffer", "NoTexture", "Highlight"}, "RasterNoTextureHighlightZ") &&
+        CompileShader(Rasterise, {"Rasterise", "WBuffer", "NoTexture", "Highlight"}, "RasterNoTextureHighlightW") &&
+        CompileShader(Rasterise, {"Rasterise", "ZBuffer", "UseTexture", "Decal"}, "RasterTextureDecalZ") &&
+        CompileShader(Rasterise, {"Rasterise", "WBuffer", "UseTexture", "Decal"}, "RasterTextureDecalW") &&
+        CompileShader(Rasterise, {"Rasterise", "ZBuffer", "UseTexture", "Modulate"}, "RasterTextureModulateZ") &&
+        CompileShader(Rasterise, {"Rasterise", "WBuffer", "UseTexture", "Modulate"}, "RasterTextureModulateW") &&
+        CompileShader(Rasterise, {"Rasterise", "ZBuffer", "UseTexture", "Toon"}, "RasterTextureToonZ") &&
+        CompileShader(Rasterise, {"Rasterise", "WBuffer", "UseTexture", "Toon"}, "RasterTextureToonW") &&
+        CompileShader(Rasterise, {"Rasterise", "ZBuffer", "UseTexture", "Highlight"}, "RasterTextureHighlightZ") &&
+        CompileShader(Rasterise, {"Rasterise", "WBuffer", "UseTexture", "Highlight"}, "RasterTextureHighlightW") &&
+        CompileShader(Rasterise, {"Rasterise", "ZBuffer", "ShadowMask"}, "RasterShadowZ") &&
+        CompileShader(Rasterise, {"Rasterise", "WBuffer", "ShadowMask"}, "RasterShadowW") &&
+        CompileShader(ClearCoarseBinMask, {"ClearCoarseBinMask"}, "ClearCoarseBinMask") &&
+        CompileShader(ClearIndirectWorkCount, {"ClearIndirectWorkCount"}, "ClearIndirectWorkCount") &&
+        CompileShader(CalcOffsets, {"CalculateWorkOffsets"}, "CalculateWorkOffsets") &&
+        CompileShader(SortWork, {"SortWork"}, "SortWork") &&
+        CompileShader(FinalPass, {"FinalPass"}, "FinalPass") &&
+        CompileShader(FinalPass, {"FinalPass", "EdgeMarking"}, "FinalPassEdge") &&
+        CompileShader(FinalPass, {"FinalPass", "Fog"}, "FinalPassFog") &&
+        CompileShader(FinalPass, {"FinalPass", "EdgeMarking", "Fog"}, "FinalPassEdgeFog") &&
+        CompileShader(FinalPass, {"FinalPass", "AntiAliasing"}, "FinalPassAA") &&
+        CompileShader(FinalPass, {"FinalPass", "AntiAliasing", "EdgeMarking"}, "FinalPassAAEdge") &&
+        CompileShader(FinalPass, {"FinalPass", "AntiAliasing", "Fog"}, "FinalPassAAFog") &&
+        CompileShader(FinalPass, {"FinalPass", "AntiAliasing", "EdgeMarking", "Fog"}, "FinalPassAAEdgeFog");
 }
 
 bool VulkanRenderer3D::CreateColorImage()
@@ -416,6 +571,9 @@ void VulkanRenderer3D::DestroyResources()
         vkDestroyFence(device, Fence, nullptr);
     if (CommandBuffer != VK_NULL_HANDLE)
         vkFreeCommandBuffers(device, Context.GetCommandPool(), 1, &CommandBuffer);
+    for (VkShaderModule module : ShaderModules)
+        vkDestroyShaderModule(device, module, nullptr);
+    ShaderModules.clear();
 
     Framebuffer = nullptr;
     ReadbackBuffer = VK_NULL_HANDLE;

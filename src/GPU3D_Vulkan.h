@@ -20,6 +20,8 @@
 #define GPU3D_VULKAN_H
 
 #include <array>
+#include <string>
+#include <vector>
 
 #include "GPU3D.h"
 #include "VulkanSupport.h"
@@ -57,9 +59,13 @@ private:
 
     VkImageLayout ColorLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     std::array<u32, ScreenWidth> ScrolledLine {};
+    std::vector<VkShaderModule> ShaderModules;
 
     bool CreateColorImage();
     bool CreateReadbackBuffer();
+    bool CompileShaders();
+    bool CompileShader(const std::string& source, const std::vector<const char*>& defines,
+                       const char* name);
     bool SubmitFrame(bool bitmapClear);
     void PrepareBitmapClear();
     void DestroyResources();

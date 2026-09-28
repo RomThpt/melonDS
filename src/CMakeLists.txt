@@ -110,6 +110,8 @@ endif()
 
 if (ENABLE_VULKANRENDERER)
     find_package(Vulkan REQUIRED)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(Shaderc REQUIRED IMPORTED_TARGET shaderc)
     target_sources(core PRIVATE
         VulkanSupport.cpp
         VulkanSupport.h
@@ -117,7 +119,7 @@ if (ENABLE_VULKANRENDERER)
         GPU_Vulkan.h
         GPU3D_Vulkan.cpp
         GPU3D_Vulkan.h)
-    target_link_libraries(core PRIVATE Vulkan::Vulkan)
+    target_link_libraries(core PRIVATE Vulkan::Vulkan PkgConfig::Shaderc)
     target_compile_definitions(core PUBLIC VULKANRENDERER_ENABLED)
 endif()
 
