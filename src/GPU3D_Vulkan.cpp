@@ -18,12 +18,15 @@
 
 #include "GPU3D_Vulkan.h"
 
+#include <algorithm>
+#include <cassert>
 #include <cstring>
 #include <string>
 
 #include <shaderc/shaderc.h>
 
 #include "GPU.h"
+#include "GPU3D_Texcache.h"
 #include "GPU3D_Compute_shaders.h"
 #include "Platform.h"
 
@@ -517,10 +520,10 @@ bool VulkanRenderer3D::CreateImage(u32 width, u32 height, VkFormat format,
 bool VulkanRenderer3D::CreateComputeResources()
 {
     constexpr VkBufferUsageFlags storageUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
-    constexpr VkDeviceSize polygonSize = 2048 * 40;
-    constexpr VkDeviceSize xSpanSize = MaxYSpanIndices * 96;
-    constexpr VkDeviceSize ySpanSize = MaxYSpanSetups * 124;
-    constexpr VkDeviceSize setupIndicesSize = MaxYSpanIndices * 8;
+    constexpr VkDeviceSize polygonSize = 2048 * sizeof(RenderPolygon);
+    constexpr VkDeviceSize xSpanSize = MaxYSpanIndices * sizeof(SpanSetupX);
+    constexpr VkDeviceSize ySpanSize = MaxYSpanSetups * sizeof(SpanSetupY);
+    constexpr VkDeviceSize setupIndicesSize = MaxYSpanIndices * sizeof(SetupIndices);
     constexpr VkDeviceSize tileSize = 4 * TileSize * TileSize * MaxWorkTiles;
     constexpr VkDeviceSize resultSize = 4 * 3 * 2 * ScreenWidth * ScreenHeight;
     constexpr VkDeviceSize binSize = MaxVariants * 16 + MaxVariants * 4 + 16 +
@@ -528,6 +531,7 @@ bool VulkanRenderer3D::CreateComputeResources()
     constexpr VkDeviceSize workSize = MaxWorkTiles * 2 * 4 * 2;
     constexpr VkDeviceSize metaSize = 592;
     constexpr VkDeviceSize clearUploadSize = 2 * 256 * 256 * sizeof(u32);
+    constexpr VkDeviceSize textureUploadSize = 1024 * 1024 * sizeof(u32);
 
     if (!CreateBuffer(PolygonBuffer, polygonSize, storageUsage) ||
         !CreateBuffer(XSpanBuffer, xSpanSize, storageUsage) ||
@@ -542,7 +546,9 @@ bool VulkanRenderer3D::CreateComputeResources()
                       storageUsage | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) ||
         !CreateBuffer(WorkBuffer, workSize, storageUsage) ||
         !CreateBuffer(MetaBuffer, metaSize, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) ||
-        !CreateBuffer(ClearUploadBuffer, clearUploadSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT))
+        !CreateBuffer(ClearUploadBuffer, clearUploadSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT) ||
+        !CreateBuffer(TextureUploadBuffer, textureUploadSize,
+                      VK_BUFFER_USAGE_TRANSFER_SRC_BIT))
         return false;
 
     VkBufferViewCreateInfo bufferViewInfo = {};
@@ -562,6 +568,15 @@ bool VulkanRenderer3D::CreateComputeResources()
                          ClearImages[i], ClearImageMemory[i], ClearImageViews[i]))
             return false;
     }
+    if (!CreateImage(1, 1, VK_FORMAT_R8G8B8A8_UINT,
+                     VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                     DummyIntegerImage, DummyIntegerMemory, DummyIntegerView,
+                     VK_IMAGE_VIEW_TYPE_2D_ARRAY) ||
+        !CreateImage(1, 1, VK_FORMAT_R8G8B8A8_UNORM,
+                     VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                     DummyCaptureImage, DummyCaptureMemory, DummyCaptureView,
+                     VK_IMAGE_VIEW_TYPE_2D_ARRAY))
+        return false;
 
     VkSamplerCreateInfo samplerInfo = {};
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -575,17 +590,34 @@ bool VulkanRenderer3D::CreateComputeResources()
     result = vkCreateSampler(Context.GetDevice(), &samplerInfo, nullptr, &ClearSampler);
     if (result != VK_SUCCESS)
         return false;
+    constexpr VkSamplerAddressMode addressModes[] = {
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        VK_SAMPLER_ADDRESS_MODE_REPEAT,
+        VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT,
+    };
+    for (u32 y = 0; y < 3; y++)
+    {
+        for (u32 x = 0; x < 3; x++)
+        {
+            samplerInfo.addressModeU = addressModes[x];
+            samplerInfo.addressModeV = addressModes[y];
+            result = vkCreateSampler(Context.GetDevice(), &samplerInfo, nullptr,
+                                     &TextureSamplers[x + y * 3]);
+            if (result != VK_SUCCESS)
+                return false;
+        }
+    }
 
     std::array<VkDescriptorPoolSize, 5> poolSizes = {{
         {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 16},
         {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 1},
         {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, 1},
-        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 3 * (MaxVariants + 1)},
         {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1},
     }};
     VkDescriptorPoolCreateInfo poolInfo = {};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    poolInfo.maxSets = 6;
+    poolInfo.maxSets = 6 + MaxVariants;
     poolInfo.poolSizeCount = poolSizes.size();
     poolInfo.pPoolSizes = poolSizes.data();
     result = vkCreateDescriptorPool(Context.GetDevice(), &poolInfo, nullptr, &DescriptorPool);
@@ -610,6 +642,15 @@ bool VulkanRenderer3D::CreateComputeResources()
     SpanImageSet = sets[3];
     ClearTextureSet = sets[4];
     OutputImageSet = sets[5];
+
+    std::array<VkDescriptorSetLayout, MaxVariants> textureLayouts;
+    textureLayouts.fill(TextureSetLayout);
+    setInfo.descriptorSetCount = textureLayouts.size();
+    setInfo.pSetLayouts = textureLayouts.data();
+    result = vkAllocateDescriptorSets(Context.GetDevice(), &setInfo,
+                                      RasterTextureSets.data());
+    if (result != VK_SUCCESS)
+        return false;
 
     const std::array<Buffer*, 8> spanBuffers = {&PolygonBuffer, &XSpanBuffer, &YSpanBuffer,
         &DepthTileBuffer, &AttrTileBuffer, &ResultBuffer, &BinResultBuffer, &WorkBuffer};
@@ -746,6 +787,7 @@ bool VulkanRenderer3D::CreateReadbackBuffer()
 
 void VulkanRenderer3D::Reset()
 {
+    ResetTextureCache();
     if (Framebuffer)
         std::memset(Framebuffer, 0, FramebufferSize);
 }
@@ -753,6 +795,504 @@ void VulkanRenderer3D::Reset()
 void VulkanRenderer3D::SetRenderSettings(int scale) noexcept
 {
     (void)scale;
+}
+
+bool VulkanRenderer3D::Variant::operator==(const Variant& other) const noexcept
+{
+    return TexParam == other.TexParam && TexPalette == other.TexPalette &&
+           BlendMode == other.BlendMode && UsesTexture == other.UsesTexture;
+}
+
+void VulkanRenderer3D::SetupAttrs(SpanSetupY* span, Polygon* polygon, int from, int to)
+{
+    span->Z0 = polygon->FinalZ[from];
+    span->W0 = polygon->FinalW[from];
+    span->Z1 = polygon->FinalZ[to];
+    span->W1 = polygon->FinalW[to];
+    span->ColorR0 = polygon->Vertices[from]->FinalColor[0];
+    span->ColorG0 = polygon->Vertices[from]->FinalColor[1];
+    span->ColorB0 = polygon->Vertices[from]->FinalColor[2];
+    span->ColorR1 = polygon->Vertices[to]->FinalColor[0];
+    span->ColorG1 = polygon->Vertices[to]->FinalColor[1];
+    span->ColorB1 = polygon->Vertices[to]->FinalColor[2];
+    span->TexcoordU0 = polygon->Vertices[from]->TexCoords[0];
+    span->TexcoordV0 = polygon->Vertices[from]->TexCoords[1];
+    span->TexcoordU1 = polygon->Vertices[to]->TexCoords[0];
+    span->TexcoordV1 = polygon->Vertices[to]->TexCoords[1];
+}
+
+void VulkanRenderer3D::SetupYSpanDummy(RenderPolygon* renderPolygon, SpanSetupY* span,
+                                       Polygon* polygon, int vertex, int side,
+                                       s32 positions[10][2])
+{
+    s32 x0 = positions[vertex][0];
+    if (side)
+    {
+        span->DxInitial = -0x40000;
+        x0--;
+    }
+    else
+    {
+        span->DxInitial = 0;
+    }
+    span->X0 = span->X1 = x0;
+    span->XMin = span->XMax = x0;
+    span->Y0 = span->Y1 = positions[vertex][1];
+    if (span->XMin < renderPolygon->XMin)
+    {
+        renderPolygon->XMin = span->XMin;
+        renderPolygon->XMinY = span->Y0;
+    }
+    if (span->XMax > renderPolygon->XMax)
+    {
+        renderPolygon->XMax = span->XMax;
+        renderPolygon->XMaxY = span->Y0;
+    }
+    span->Increment = 0;
+    span->I0 = span->I1 = span->IRecip = 0;
+    span->Linear = true;
+    span->XCovIncr = 0;
+    span->IsDummy = true;
+    SetupAttrs(span, polygon, vertex, vertex);
+}
+
+void VulkanRenderer3D::SetupYSpan(RenderPolygon* renderPolygon, SpanSetupY* span,
+                                  Polygon* polygon, int from, int to, int side,
+                                  s32 positions[10][2])
+{
+    span->X0 = positions[from][0];
+    span->X1 = positions[to][0];
+    span->Y0 = positions[from][1];
+    span->Y1 = positions[to][1];
+    SetupAttrs(span, polygon, from, to);
+
+    s32 minXY;
+    s32 maxXY;
+    bool negative = false;
+    if (span->X1 > span->X0)
+    {
+        span->XMin = span->X0;
+        span->XMax = span->X1 - 1;
+        minXY = span->Y0;
+        maxXY = span->Y1;
+    }
+    else if (span->X1 < span->X0)
+    {
+        span->XMin = span->X1;
+        span->XMax = span->X0 - 1;
+        negative = true;
+        minXY = span->Y1;
+        maxXY = span->Y0;
+    }
+    else
+    {
+        span->XMin = span->X0;
+        if (side) span->XMin--;
+        span->XMax = span->XMin;
+        minXY = span->Y0;
+        maxXY = span->Y0;
+    }
+    if (span->XMin < renderPolygon->XMin)
+    {
+        renderPolygon->XMin = span->XMin;
+        renderPolygon->XMinY = minXY;
+    }
+    if (span->XMax > renderPolygon->XMax)
+    {
+        renderPolygon->XMax = span->XMax;
+        renderPolygon->XMaxY = maxXY;
+    }
+
+    span->IsDummy = false;
+    const s32 xLength = span->XMax + 1 - span->XMin;
+    const s32 yLength = span->Y1 - span->Y0;
+    if (yLength == 0)
+        span->Increment = 0;
+    else if (yLength == xLength)
+        span->Increment = 0x40000;
+    else
+    {
+        const s32 yReciprocal = (1 << 18) / yLength;
+        span->Increment = (span->X1 - span->X0) * yReciprocal;
+        if (span->Increment < 0) span->Increment = -span->Increment;
+    }
+
+    const bool xMajor = span->Increment > 0x40000;
+    if (side)
+    {
+        if (xMajor)
+            span->DxInitial = negative ? 0x60000 : span->Increment - 0x20000;
+        else if (span->Increment != 0)
+            span->DxInitial = negative ? 0x40000 : 0;
+        else
+            span->DxInitial = -0x40000;
+    }
+    else
+    {
+        if (xMajor)
+            span->DxInitial = negative ? span->Increment + 0x20000 : 0x20000;
+        else if (span->Increment != 0)
+            span->DxInitial = negative ? 0x40000 : 0;
+        else
+            span->DxInitial = 0;
+    }
+    if (xMajor)
+    {
+        span->I0 = side ? span->X0 - 1 : span->X0;
+        span->I1 = side ? span->X1 - 1 : span->X1;
+        span->XCovIncr = (yLength << 10) / xLength;
+    }
+    else
+    {
+        span->I0 = span->Y0;
+        span->I1 = span->Y1;
+    }
+    span->IRecip = span->I0 != span->I1 ? (1 << 30) / (span->I1 - span->I0) : 0;
+    span->Linear = span->W0 == span->W1 && !(span->W0 & 0x7E) && !(span->W1 & 0x7E);
+    if ((span->W0 & 1) && !(span->W1 & 1))
+    {
+        span->W0n = (span->W0 - 1) >> 1;
+        span->W0d = (span->W0 + 1) >> 1;
+        span->W1d = span->W1 >> 1;
+    }
+    else
+    {
+        span->W0n = span->W0 >> 1;
+        span->W0d = span->W0 >> 1;
+        span->W1d = span->W1 >> 1;
+    }
+}
+
+bool VulkanRenderer3D::PreparePolygons(u32& numYSpans, u32& numSetupIndices,
+                                       std::vector<Variant>& variants, bool& wBuffer)
+{
+    numYSpans = 0;
+    numSetupIndices = 0;
+    variants.clear();
+    YSpanIndices.resize(MaxYSpanIndices);
+    const bool textureMapsEnabled = (GPU3D.RenderDispCnt & 1) != 0;
+
+    for (u32 i = 0; i < GPU3D.RenderNumPolygons; i++)
+    {
+        Polygon* polygon = GPU3D.RenderPolygonRAM[i];
+        Variant variant = {};
+        variant.TexParam = polygon->TexParam;
+        variant.TexPalette = polygon->TexPalette;
+        variant.BlendMode = polygon->IsShadowMask ? 4 : ((polygon->Attr >> 4) & 3);
+        variant.UsesTexture = textureMapsEnabled && ((polygon->TexParam >> 26) & 7);
+        variant.Width = TextureWidth(polygon->TexParam);
+        variant.Height = TextureHeight(polygon->TexParam);
+        auto variantIt = std::find(variants.begin(), variants.end(), variant);
+        if (variantIt == variants.end())
+        {
+            if (variants.size() >= MaxVariants)
+                return false;
+            variants.push_back(variant);
+            RenderPolygons[i].Variant = variants.size() - 1;
+        }
+        else
+        {
+            RenderPolygons[i].Variant = std::distance(variants.begin(), variantIt);
+        }
+        RenderPolygons[i].TextureLayer = 0.0f;
+        RenderPolygons[i].Attr = polygon->Attr;
+        RenderPolygons[i].FirstXSpan = numSetupIndices;
+
+        const u32 vertexCount = polygon->NumVertices;
+        u32 currentLeft = polygon->VTop;
+        u32 currentRight = polygon->VTop;
+        u32 nextLeft;
+        u32 nextRight;
+        if (polygon->FacingView)
+        {
+            nextLeft = (currentLeft + 1) % vertexCount;
+            nextRight = currentRight == 0 ? vertexCount - 1 : currentRight - 1;
+        }
+        else
+        {
+            nextLeft = currentLeft == 0 ? vertexCount - 1 : currentLeft - 1;
+            nextRight = (currentRight + 1) % vertexCount;
+        }
+
+        s32 positions[10][2];
+        s32 yTop = ScreenHeight;
+        s32 yBottom = 0;
+        for (u32 vertex = 0; vertex < vertexCount; vertex++)
+        {
+            positions[vertex][0] = polygon->Vertices[vertex]->FinalPosition[0];
+            positions[vertex][1] = polygon->Vertices[vertex]->FinalPosition[1];
+            yTop = std::min(yTop, positions[vertex][1]);
+            yBottom = std::max(yBottom, positions[vertex][1]);
+        }
+        RenderPolygons[i].YTop = yTop;
+        RenderPolygons[i].YBot = yBottom;
+        RenderPolygons[i].XMin = ScreenWidth;
+        RenderPolygons[i].XMax = 0;
+
+        if (yBottom == yTop)
+        {
+            u32 left = 0;
+            u32 right = 0;
+            RenderPolygons[i].YBot++;
+            for (u32 vertex : {1U, vertexCount - 1})
+            {
+                if (positions[vertex][0] < positions[left][0]) left = vertex;
+                if (positions[vertex][0] > positions[right][0]) right = vertex;
+            }
+            if (numYSpans + 2 > MaxYSpanSetups || numSetupIndices >= MaxYSpanIndices)
+                return false;
+            const u32 leftSpan = numYSpans;
+            SetupYSpanDummy(&RenderPolygons[i], &YSpanSetups[numYSpans++], polygon,
+                            left, 0, positions);
+            const u32 rightSpan = numYSpans;
+            SetupYSpanDummy(&RenderPolygons[i], &YSpanSetups[numYSpans++], polygon,
+                            right, 1, positions);
+            YSpanIndices[numSetupIndices++] = {static_cast<u16>(i),
+                static_cast<u16>(leftSpan), static_cast<u16>(rightSpan),
+                static_cast<u16>(yTop)};
+        }
+        else
+        {
+            if (numYSpans + 2 > MaxYSpanSetups)
+                return false;
+            u32 leftSpan = numYSpans;
+            SetupYSpan(&RenderPolygons[i], &YSpanSetups[numYSpans++], polygon,
+                       currentLeft, nextLeft, 0, positions);
+            u32 rightSpan = numYSpans;
+            SetupYSpan(&RenderPolygons[i], &YSpanSetups[numYSpans++], polygon,
+                       currentRight, nextRight, 1, positions);
+            for (s32 y = yTop; y < yBottom; y++)
+            {
+                if (y >= positions[nextLeft][1] && currentLeft != polygon->VBottom)
+                {
+                    while (y >= positions[nextLeft][1] && currentLeft != polygon->VBottom)
+                    {
+                        currentLeft = nextLeft;
+                        nextLeft = polygon->FacingView ? (currentLeft + 1) % vertexCount :
+                            (currentLeft == 0 ? vertexCount - 1 : currentLeft - 1);
+                    }
+                    if (numYSpans >= MaxYSpanSetups) return false;
+                    leftSpan = numYSpans;
+                    SetupYSpan(&RenderPolygons[i], &YSpanSetups[numYSpans++], polygon,
+                               currentLeft, nextLeft, 0, positions);
+                }
+                if (y >= positions[nextRight][1] && currentRight != polygon->VBottom)
+                {
+                    while (y >= positions[nextRight][1] && currentRight != polygon->VBottom)
+                    {
+                        currentRight = nextRight;
+                        nextRight = polygon->FacingView ?
+                            (currentRight == 0 ? vertexCount - 1 : currentRight - 1) :
+                            (currentRight + 1) % vertexCount;
+                    }
+                    if (numYSpans >= MaxYSpanSetups) return false;
+                    rightSpan = numYSpans;
+                    SetupYSpan(&RenderPolygons[i], &YSpanSetups[numYSpans++], polygon,
+                               currentRight, nextRight, 1, positions);
+                }
+                if (numSetupIndices >= MaxYSpanIndices) return false;
+                YSpanIndices[numSetupIndices++] = {static_cast<u16>(i),
+                    static_cast<u16>(leftSpan), static_cast<u16>(rightSpan),
+                    static_cast<u16>(y)};
+            }
+        }
+    }
+    wBuffer = GPU3D.RenderNumPolygons > 0 && GPU3D.RenderPolygonRAM[0]->WBuffer;
+    return true;
+}
+
+bool VulkanRenderer3D::UploadTexture(TextureResource& texture, u32 width, u32 height,
+                                     const u32* pixels)
+{
+    const VkDeviceSize size = VkDeviceSize(width) * height * sizeof(u32);
+    std::memcpy(TextureUploadBuffer.Mapped, pixels, size);
+
+    VkResult result = vkResetCommandBuffer(CommandBuffer, 0);
+    if (result != VK_SUCCESS) return false;
+    VkCommandBufferBeginInfo beginInfo = {};
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    result = vkBeginCommandBuffer(CommandBuffer, &beginInfo);
+    if (result != VK_SUCCESS) return false;
+
+    VkMemoryBarrier hostBarrier = {};
+    hostBarrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    hostBarrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    hostBarrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(CommandBuffer, VK_PIPELINE_STAGE_HOST_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &hostBarrier,
+                         0, nullptr, 0, nullptr);
+    VkImageMemoryBarrier toTransfer = {};
+    toTransfer.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    toTransfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toTransfer.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    toTransfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toTransfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    toTransfer.image = texture.Image;
+    toTransfer.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    toTransfer.subresourceRange.levelCount = 1;
+    toTransfer.subresourceRange.layerCount = 1;
+    vkCmdPipelineBarrier(CommandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                         1, &toTransfer);
+
+    VkBufferImageCopy copy = {};
+    copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copy.imageSubresource.layerCount = 1;
+    copy.imageExtent = {width, height, 1};
+    vkCmdCopyBufferToImage(CommandBuffer, TextureUploadBuffer.Handle, texture.Image,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+    VkImageMemoryBarrier toSample = toTransfer;
+    toSample.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    toSample.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    toSample.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    toSample.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    vkCmdPipelineBarrier(CommandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr,
+                         1, &toSample);
+    result = vkEndCommandBuffer(CommandBuffer);
+    if (result != VK_SUCCESS) return false;
+    result = vkResetFences(Context.GetDevice(), 1, &Fence);
+    if (result != VK_SUCCESS) return false;
+    VkSubmitInfo submitInfo = {};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &CommandBuffer;
+    result = vkQueueSubmit(Context.GetQueue(), 1, &submitInfo, Fence);
+    if (result != VK_SUCCESS) return false;
+    return vkWaitForFences(Context.GetDevice(), 1, &Fence, VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+}
+
+VulkanRenderer3D::TextureResource* VulkanRenderer3D::GetTexture(u32 texParam,
+                                                                u32 texPalette)
+{
+    const u32 format = (texParam >> 26) & 7;
+    u32 normalizedParam = texParam & ~0xC00F0000;
+    u64 key = normalizedParam;
+    if (format != 7)
+    {
+        key |= u64(texPalette) << 32;
+        if (format == 5) key &= ~(u64(1) << 29);
+    }
+    auto found = TextureCache.find(key);
+    if (found != TextureCache.end())
+        return found->second.get();
+
+    const u32 width = TextureWidth(texParam);
+    const u32 height = TextureHeight(texParam);
+    const u32 address = (normalizedParam & 0xFFFF) * 8;
+    std::vector<u32> pixels(width * height);
+    if (format == 7)
+    {
+        ConvertBitmapTexture<outputFmt_RGB6A5>(width, height, pixels.data(), address, GPU);
+    }
+    else if (format == 5)
+    {
+        u32 auxiliaryAddress = 0x20000 + ((address & 0x1FFFC) >> 1);
+        if (address >= 0x40000) auxiliaryAddress += 0x10000;
+        ConvertCompressedTexture<outputFmt_RGB6A5>(width, height, pixels.data(), address,
+            auxiliaryAddress, texPalette * 16, GPU);
+    }
+    else
+    {
+        u32 paletteAddress = texPalette * 16;
+        if (format == 2) paletteAddress >>= 1;
+        paletteAddress &= 0x1FFFF;
+        const bool transparent = (normalizedParam & (1 << 29)) != 0;
+        switch (format)
+        {
+        case 1:
+            ConvertAXIYTexture<outputFmt_RGB6A5, 3, 5>(width, height, pixels.data(),
+                address, paletteAddress, GPU);
+            break;
+        case 2:
+            ConvertNColorsTexture<outputFmt_RGB6A5, 2>(width, height, pixels.data(),
+                address, paletteAddress, transparent, GPU);
+            break;
+        case 3:
+            ConvertNColorsTexture<outputFmt_RGB6A5, 4>(width, height, pixels.data(),
+                address, paletteAddress, transparent, GPU);
+            break;
+        case 4:
+            ConvertNColorsTexture<outputFmt_RGB6A5, 8>(width, height, pixels.data(),
+                address, paletteAddress, transparent, GPU);
+            break;
+        case 6:
+            ConvertAXIYTexture<outputFmt_RGB6A5, 5, 3>(width, height, pixels.data(),
+                address, paletteAddress, GPU);
+            break;
+        default:
+            return nullptr;
+        }
+    }
+
+    auto texture = std::make_unique<TextureResource>();
+    if (!CreateImage(width, height, VK_FORMAT_R8G8B8A8_UINT,
+                     VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                     texture->Image, texture->Memory, texture->View,
+                     VK_IMAGE_VIEW_TYPE_2D_ARRAY) ||
+        !UploadTexture(*texture, width, height, pixels.data()))
+        return nullptr;
+    TextureResource* result = texture.get();
+    TextureCache.emplace(key, std::move(texture));
+    return result;
+}
+
+bool VulkanRenderer3D::PrepareTextures(std::vector<Variant>& variants)
+{
+    std::vector<VkDescriptorImageInfo> imageInfos(variants.size() * 3);
+    std::vector<VkWriteDescriptorSet> writes(variants.size() * 3);
+    for (u32 i = 0; i < variants.size(); i++)
+    {
+        Variant& variant = variants[i];
+        const u32 wrapS = (variant.TexParam >> 16) & 1;
+        const u32 wrapT = (variant.TexParam >> 17) & 1;
+        const u32 mirrorS = (variant.TexParam >> 18) & 1;
+        const u32 mirrorT = (variant.TexParam >> 19) & 1;
+        variant.Sampler = TextureSamplers[(wrapS ? (mirrorS ? 2 : 1) : 0) +
+                                           (wrapT ? (mirrorT ? 2 : 1) : 0) * 3];
+        if (variant.UsesTexture)
+        {
+            variant.Texture = GetTexture(variant.TexParam, variant.TexPalette);
+            if (!variant.Texture) return false;
+        }
+        for (u32 binding = 0; binding < 3; binding++)
+        {
+            const u32 index = i * 3 + binding;
+            imageInfos[index].sampler = variant.Sampler;
+            imageInfos[index].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            if (binding == 0)
+                imageInfos[index].imageView = variant.Texture ? variant.Texture->View :
+                                                               DummyIntegerView;
+            else
+                imageInfos[index].imageView = DummyCaptureView;
+            writes[index].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[index].dstSet = RasterTextureSets[i];
+            writes[index].dstBinding = binding;
+            writes[index].descriptorCount = 1;
+            writes[index].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            writes[index].pImageInfo = &imageInfos[index];
+        }
+    }
+    if (!writes.empty())
+        vkUpdateDescriptorSets(Context.GetDevice(), writes.size(), writes.data(), 0, nullptr);
+    return true;
+}
+
+void VulkanRenderer3D::ResetTextureCache()
+{
+    for (auto& [key, texture] : TextureCache)
+    {
+        (void)key;
+        if (texture->View != VK_NULL_HANDLE)
+            vkDestroyImageView(Context.GetDevice(), texture->View, nullptr);
+        if (texture->Image != VK_NULL_HANDLE)
+            vkDestroyImage(Context.GetDevice(), texture->Image, nullptr);
+        if (texture->Memory != VK_NULL_HANDLE)
+            vkFreeMemory(Context.GetDevice(), texture->Memory, nullptr);
+    }
+    TextureCache.clear();
 }
 
 void VulkanRenderer3D::PrepareBitmapClear()
@@ -782,6 +1322,8 @@ bool VulkanRenderer3D::SubmitFrame(bool bitmapClear)
     VkDevice device = Context.GetDevice();
 
     MetaUniform meta = {};
+    meta.NumPolygons = GPU3D.RenderNumPolygons;
+    meta.NumVariants = FrameVariants.size();
     meta.AlphaRef = GPU3D.RenderAlphaRef;
     meta.DispCnt = GPU3D.RenderDispCnt;
     {
@@ -899,6 +1441,29 @@ bool VulkanRenderer3D::SubmitFrame(bool bitmapClear)
         }
     }
 
+    if (DummyImageLayout == VK_IMAGE_LAYOUT_UNDEFINED)
+    {
+        const VkImage dummyImages[] = {DummyIntegerImage, DummyCaptureImage};
+        for (VkImage image : dummyImages)
+        {
+            VkImageMemoryBarrier toSample = {};
+            toSample.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            toSample.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            toSample.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            toSample.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+            toSample.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toSample.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            toSample.image = image;
+            toSample.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            toSample.subresourceRange.levelCount = 1;
+            toSample.subresourceRange.layerCount = 1;
+            vkCmdPipelineBarrier(CommandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
+                                 0, nullptr, 1, &toSample);
+        }
+        DummyImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    }
+
     VkImageMemoryBarrier toGeneral = {};
     toGeneral.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     toGeneral.srcAccessMask = ColorLayout == VK_IMAGE_LAYOUT_UNDEFINED ? 0 :
@@ -931,8 +1496,106 @@ bool VulkanRenderer3D::SubmitFrame(bool bitmapClear)
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &computeBarrier,
                          0, nullptr, 0, nullptr);
 
+    if (FrameYSpanCount > 0)
+    {
+        vkCmdBindPipeline(CommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          ComputePipelines[22]);
+        vkCmdBindDescriptorSets(CommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                BasePipelineLayout, 0, 2, baseSets, 0, nullptr);
+        vkCmdDispatch(CommandBuffer, (FrameVariants.size() + 31) / 32, 1, 1);
+
+        const VkDescriptorSet spanSets[] = {SpanBufferSet, UniformSet, SpanImageSet};
+        vkCmdBindPipeline(CommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          ComputePipelines[FrameWBuffer ? 1 : 0]);
+        vkCmdBindDescriptorSets(CommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                SpanPipelineLayout, 0, 3, spanSets, 0, nullptr);
+        vkCmdDispatch(CommandBuffer, (FrameSetupIndexCount + 31) / 32, 1, 1);
+        vkCmdPipelineBarrier(CommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &computeBarrier,
+                             0, nullptr, 0, nullptr);
+
+        vkCmdBindPipeline(CommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          ComputePipelines[2]);
+        vkCmdBindDescriptorSets(CommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                BasePipelineLayout, 0, 2, baseSets, 0, nullptr);
+        vkCmdDispatch(CommandBuffer, (GPU3D.RenderNumPolygons + 31) / 32,
+                      ScreenWidth / (8 * TileSize), ScreenHeight / (4 * TileSize));
+        vkCmdPipelineBarrier(CommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &computeBarrier,
+                             0, nullptr, 0, nullptr);
+
+        vkCmdBindPipeline(CommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          ComputePipelines[23]);
+        vkCmdDispatch(CommandBuffer, (FrameVariants.size() + 31) / 32, 1, 1);
+
+        VkMemoryBarrier indirectBarrier = computeBarrier;
+        indirectBarrier.dstAccessMask |= VK_ACCESS_INDIRECT_COMMAND_READ_BIT;
+        vkCmdPipelineBarrier(CommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                             0, 1, &indirectBarrier, 0, nullptr, 0, nullptr);
+
+        vkCmdBindPipeline(CommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                          ComputePipelines[24]);
+        vkCmdDispatchIndirect(CommandBuffer, BinResultBuffer.Handle,
+                              MaxVariants * 16 + MaxVariants * 4);
+        vkCmdPipelineBarrier(CommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+                             0, 1, &indirectBarrier, 0, nullptr, 0, nullptr);
+
+        const bool highlight = (GPU3D.RenderDispCnt & (1 << 1)) != 0;
+        struct RasterPushConstants
+        {
+            u32 Variant;
+            u32 Padding;
+            float InverseTextureSize[2];
+            s32 TextureIsCapture;
+            float CaptureYOffset;
+        };
+        static_assert(sizeof(RasterPushConstants) == 24);
+        for (u32 i = 0; i < FrameVariants.size(); i++)
+        {
+            const Variant& variant = FrameVariants[i];
+            u32 pipeline = 5 + (FrameWBuffer ? 1 : 0);
+            if (variant.BlendMode == 4)
+                pipeline = 19 + (FrameWBuffer ? 1 : 0);
+            else if (variant.UsesTexture)
+            {
+                if (variant.BlendMode == 0)
+                    pipeline = 13 + (FrameWBuffer ? 1 : 0);
+                else if (variant.BlendMode == 2)
+                    pipeline = (highlight ? 17 : 15) + (FrameWBuffer ? 1 : 0);
+                else
+                    pipeline = 11 + (FrameWBuffer ? 1 : 0);
+            }
+            else if (variant.BlendMode == 2)
+            {
+                pipeline = (highlight ? 9 : 7) + (FrameWBuffer ? 1 : 0);
+            }
+
+            RasterPushConstants constants = {};
+            constants.Variant = i;
+            constants.InverseTextureSize[0] = 1.0f / variant.Width;
+            constants.InverseTextureSize[1] = 1.0f / variant.Height;
+            vkCmdBindPipeline(CommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                              ComputePipelines[pipeline]);
+            const VkDescriptorSet rasterSets[] = {
+                RasterBufferSet, UniformSet, RasterTextureSets[i]};
+            vkCmdBindDescriptorSets(CommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    RasterPipelineLayout, 0, 3, rasterSets, 0, nullptr);
+            vkCmdPushConstants(CommandBuffer, RasterPipelineLayout,
+                               VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants), &constants);
+            vkCmdDispatchIndirect(CommandBuffer, BinResultBuffer.Handle, i * 16);
+        }
+        vkCmdPipelineBarrier(CommandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &computeBarrier,
+                             0, nullptr, 0, nullptr);
+    }
+
     const VkDescriptorSet textureSets[] = {RasterBufferSet, UniformSet, ClearTextureSet};
-    vkCmdBindPipeline(CommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE, ComputePipelines[3]);
+    vkCmdBindPipeline(CommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      ComputePipelines[FrameWBuffer ? 4 : 3]);
     vkCmdBindDescriptorSets(CommandBuffer, VK_PIPELINE_BIND_POINT_COMPUTE,
                             TexturePipelineLayout, 0, 3, textureSets, 0, nullptr);
     vkCmdDispatch(CommandBuffer, TilesPerLine, TileLines, 1);
@@ -1002,11 +1665,36 @@ bool VulkanRenderer3D::SubmitFrame(bool bitmapClear)
 void VulkanRenderer3D::RenderFrame()
 {
     auto textureDirty = GPU.VRAMDirty_Texture.DeriveState(GPU.VRAMMap_Texture, GPU);
-    GPU.MakeVRAMFlat_TextureCoherent(textureDirty);
+    auto paletteDirty = GPU.VRAMDirty_TexPal.DeriveState(GPU.VRAMMap_TexPal, GPU);
+    const bool textureChanged = GPU.MakeVRAMFlat_TextureCoherent(textureDirty);
+    const bool paletteChanged = GPU.MakeVRAMFlat_TexPalCoherent(paletteDirty);
+    if (textureChanged || paletteChanged)
+        ResetTextureCache();
 
     const bool bitmapClear = (GPU3D.RenderDispCnt & (1 << 14)) != 0;
     if (bitmapClear)
         PrepareBitmapClear();
+
+    if (!PreparePolygons(FrameYSpanCount, FrameSetupIndexCount, FrameVariants,
+                         FrameWBuffer))
+    {
+        Log(LogLevel::Error, "Vulkan: polygon setup exceeded renderer limits\n");
+        return;
+    }
+    if (!PrepareTextures(FrameVariants))
+    {
+        Log(LogLevel::Error, "Vulkan: failed to prepare polygon textures\n");
+        return;
+    }
+    if (FrameYSpanCount > 0)
+    {
+        std::memcpy(YSpanBuffer.Mapped, YSpanSetups.data(),
+                    FrameYSpanCount * sizeof(SpanSetupY));
+        std::memcpy(SetupIndicesBuffer.Mapped, YSpanIndices.data(),
+                    FrameSetupIndexCount * sizeof(SetupIndices));
+        std::memcpy(PolygonBuffer.Mapped, RenderPolygons.data(),
+                    GPU3D.RenderNumPolygons * sizeof(RenderPolygon));
+    }
 
     if (!SubmitFrame(bitmapClear))
         Log(LogLevel::Error, "Vulkan: failed to submit 3D frame\n");
@@ -1064,10 +1752,28 @@ void VulkanRenderer3D::DestroyResources()
         return;
 
     vkDeviceWaitIdle(device);
+    ResetTextureCache();
     if (DescriptorPool != VK_NULL_HANDLE)
         vkDestroyDescriptorPool(device, DescriptorPool, nullptr);
     if (ClearSampler != VK_NULL_HANDLE)
         vkDestroySampler(device, ClearSampler, nullptr);
+    for (VkSampler sampler : TextureSamplers)
+    {
+        if (sampler != VK_NULL_HANDLE)
+            vkDestroySampler(device, sampler, nullptr);
+    }
+    if (DummyIntegerView != VK_NULL_HANDLE)
+        vkDestroyImageView(device, DummyIntegerView, nullptr);
+    if (DummyIntegerImage != VK_NULL_HANDLE)
+        vkDestroyImage(device, DummyIntegerImage, nullptr);
+    if (DummyIntegerMemory != VK_NULL_HANDLE)
+        vkFreeMemory(device, DummyIntegerMemory, nullptr);
+    if (DummyCaptureView != VK_NULL_HANDLE)
+        vkDestroyImageView(device, DummyCaptureView, nullptr);
+    if (DummyCaptureImage != VK_NULL_HANDLE)
+        vkDestroyImage(device, DummyCaptureImage, nullptr);
+    if (DummyCaptureMemory != VK_NULL_HANDLE)
+        vkFreeMemory(device, DummyCaptureMemory, nullptr);
     if (SetupIndicesView != VK_NULL_HANDLE)
         vkDestroyBufferView(device, SetupIndicesView, nullptr);
     for (u32 i = 0; i < 2; i++)
@@ -1079,6 +1785,7 @@ void VulkanRenderer3D::DestroyResources()
         if (ClearImageMemory[i] != VK_NULL_HANDLE)
             vkFreeMemory(device, ClearImageMemory[i], nullptr);
     }
+    DestroyBuffer(TextureUploadBuffer);
     DestroyBuffer(ClearUploadBuffer);
     DestroyBuffer(MetaBuffer);
     DestroyBuffer(WorkBuffer);

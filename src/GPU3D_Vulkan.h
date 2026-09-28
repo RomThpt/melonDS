@@ -20,7 +20,9 @@
 #define GPU3D_VULKAN_H
 
 #include <array>
+#include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "GPU3D.h"
@@ -62,6 +64,76 @@ private:
         VkDeviceMemory Memory = VK_NULL_HANDLE;
         VkDeviceSize Size = 0;
         void* Mapped = nullptr;
+    };
+
+    struct SpanSetupY
+    {
+        s32 Z0, Z1, W0, W1;
+        s32 ColorR0, ColorG0, ColorB0;
+        s32 ColorR1, ColorG1, ColorB1;
+        s32 TexcoordU0, TexcoordV0;
+        s32 TexcoordU1, TexcoordV1;
+        s32 I0, I1;
+        s32 Linear;
+        s32 IRecip;
+        s32 W0n, W0d, W1d;
+        s32 Increment;
+        s32 X0, X1, Y0, Y1;
+        s32 XMin, XMax;
+        s32 DxInitial;
+        s32 XCovIncr;
+        u32 IsDummy;
+    };
+
+    struct SpanSetupX
+    {
+        s32 X0, X1;
+        s32 EdgeLenL, EdgeLenR, EdgeCovL, EdgeCovR;
+        s32 XRecip;
+        u32 Flags;
+        s32 Z0, Z1, W0, W1;
+        s32 ColorR0, ColorG0, ColorB0;
+        s32 ColorR1, ColorG1, ColorB1;
+        s32 TexcoordU0, TexcoordV0;
+        s32 TexcoordU1, TexcoordV1;
+        s32 CovLInitial, CovRInitial;
+    };
+
+    struct SetupIndices
+    {
+        u16 PolyIdx, SpanIdxL, SpanIdxR, Y;
+    };
+
+    struct RenderPolygon
+    {
+        u32 FirstXSpan;
+        s32 YTop, YBot;
+        s32 XMin, XMax;
+        s32 XMinY, XMaxY;
+        u32 Variant;
+        u32 Attr;
+        float TextureLayer;
+    };
+
+    struct TextureResource
+    {
+        VkImage Image = VK_NULL_HANDLE;
+        VkDeviceMemory Memory = VK_NULL_HANDLE;
+        VkImageView View = VK_NULL_HANDLE;
+    };
+
+    struct Variant
+    {
+        u32 TexParam;
+        u32 TexPalette;
+        u16 Width;
+        u16 Height;
+        u8 BlendMode;
+        bool UsesTexture;
+        TextureResource* Texture = nullptr;
+        VkSampler Sampler = VK_NULL_HANDLE;
+
+        bool operator==(const Variant& other) const noexcept;
     };
 
     Vulkan::Context& Context;
@@ -110,6 +182,7 @@ private:
     Buffer WorkBuffer;
     Buffer MetaBuffer;
     Buffer ClearUploadBuffer;
+    Buffer TextureUploadBuffer;
     VkBufferView SetupIndicesView = VK_NULL_HANDLE;
     VkImage ClearImages[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkDeviceMemory ClearImageMemory[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
@@ -117,6 +190,23 @@ private:
     VkImageLayout ClearImageLayouts[2] = {VK_IMAGE_LAYOUT_UNDEFINED,
                                          VK_IMAGE_LAYOUT_UNDEFINED};
     VkSampler ClearSampler = VK_NULL_HANDLE;
+    VkSampler TextureSamplers[9] = {};
+    VkImage DummyIntegerImage = VK_NULL_HANDLE;
+    VkDeviceMemory DummyIntegerMemory = VK_NULL_HANDLE;
+    VkImageView DummyIntegerView = VK_NULL_HANDLE;
+    VkImage DummyCaptureImage = VK_NULL_HANDLE;
+    VkDeviceMemory DummyCaptureMemory = VK_NULL_HANDLE;
+    VkImageView DummyCaptureView = VK_NULL_HANDLE;
+    VkImageLayout DummyImageLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    std::array<VkDescriptorSet, MaxVariants> RasterTextureSets {};
+    std::unordered_map<u64, std::unique_ptr<TextureResource>> TextureCache;
+    std::vector<SetupIndices> YSpanIndices;
+    std::array<SpanSetupY, MaxYSpanSetups> YSpanSetups {};
+    std::array<RenderPolygon, 2048> RenderPolygons {};
+    std::vector<Variant> FrameVariants;
+    u32 FrameYSpanCount = 0;
+    u32 FrameSetupIndexCount = 0;
+    bool FrameWBuffer = false;
 
     bool CreateColorImage();
     bool CreateReadbackBuffer();
@@ -137,6 +227,18 @@ private:
                               bool pushConstants, VkPipelineLayout& layout);
     bool SubmitFrame(bool bitmapClear);
     void PrepareBitmapClear();
+    bool PreparePolygons(u32& numYSpans, u32& numSetupIndices,
+                         std::vector<Variant>& variants, bool& wBuffer);
+    bool PrepareTextures(std::vector<Variant>& variants);
+    TextureResource* GetTexture(u32 texParam, u32 texPalette);
+    bool UploadTexture(TextureResource& texture, u32 width, u32 height,
+                       const u32* pixels);
+    void ResetTextureCache();
+    void SetupAttrs(SpanSetupY* span, Polygon* polygon, int from, int to);
+    void SetupYSpan(RenderPolygon* renderPolygon, SpanSetupY* span, Polygon* polygon,
+                    int from, int to, int side, s32 positions[10][2]);
+    void SetupYSpanDummy(RenderPolygon* renderPolygon, SpanSetupY* span, Polygon* polygon,
+                         int vertex, int side, s32 positions[10][2]);
     void DestroyResources();
 };
 
